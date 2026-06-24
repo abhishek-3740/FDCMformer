@@ -1,0 +1,281 @@
+================================================================================
+NEXT-CR : ECRformer + M9 (losses) + M7 (MIMO/gated skips)
+Changes, rationale, training instructions, and a final review.
+================================================================================
+
+This repo is a clone of zzaiyan/ECRformer (ISPRS 2026) with two roadmap
+modifications applied:
+
+  * M9 - Spectral-Angle loss + Fourier amplitude loss + foundation-model
+          perceptual loss (training-time only, ZERO inference cost).
+  * M7 - MIMO pyramid supervision + gated cross-scale skip connections.
+
+Everything is configurable and backward-compatible: set a weight to 0 or a flag
+to False to recover the original ECRformer behaviour.
+
+
+================================================================================
+1. WHAT WAS CHANGED (file by file)
+================================================================================
+
+NEW  util/losses.py
+  Differentiable training losses for M9:
+    - SAMLoss        : mean spectral angle = arccos(<p,t>/(|p||t|)).
+                       Cosine clamped to [-1+e, 1-e] so the arccos gradient
+                       stays finite. Directly optimises the SAM metric, which
+                       the baseline never trained on.
+    - FFTLoss        : frequency-domain consistency via torch.fft.rfft2.
+                       mode='amplitude' -> L1 on magnitude spectra (default).
+                       mode='focal'     -> Focal Frequency Loss (complex
+                       distance, adaptively re-weighted hard frequencies).
+                       Targets the low-frequency cloud signature.
+    - PerceptualLoss : frozen feature-space loss.
+                       backbone='lpips'     -> VGG-LPIPS on the RGB bands
+                                               (B4,B3,B2 = indices 3,2,1).
+                                               Already shipped with the repo,
+                                               no extra setup.
+                       backbone='remoteclip'-> optional RS foundation model
+                                               (needs open_clip_torch + weights).
+    - AuxiliaryLoss  : bundles the three terms, instantiates only those with
+                       weight>0, returns (total, parts) for logging.
+  NOTE: the `lpips` import is lazy, so SAM/FFT work even if `lpips` is absent.
+
+MODIFIED  models/ecrformer_model.py
+  - Added GatedSkipFusion module (M7 gated skip):
+        g   = sigmoid(Conv1x1([x_dec ; x_enc]))     # gate over enc channels
+        out = concat([x_dec, g * x_enc])
+    Output channel count == the original concat([x_dec, x_enc]), so the
+    downstream `fuser`/decoder blocks are UNCHANGED -> true drop-in. The gate
+    learns to suppress cloud-contaminated encoder skip features before fusion
+    (addresses bottleneck B9). Bias is zero-initialised -> gate starts at 0.5
+    (half-pass), so training begins near the original behaviour.
+  - Added constructor arg `gated_skip: bool = True` and `self.skip_gates`
+    (an nn.ModuleList, one gate per decoder level; None when disabled).
+  - forward() now uses the gate, with a clean fallback to plain torch.cat when
+    gated_skip=False.
+
+  ABOUT MIMO (M7 part 1): the model ALREADY emits a predicted clean image at
+  every decoder scale through the existing `up_proj` heads (1/4, 1/2, 1), and
+  train.py ALREADY supervises them against down-sampled targets. That is exactly
+  the MSDT MIMO-pyramid mechanism, so no new heads were needed; the genuinely
+  new architectural piece for M7 is the gated skip connection above.
+
+MODIFIED  train.py
+  - Imports AuxiliaryLoss.
+  - CloudRemovalModel.__init__ builds self.aux_loss from config.train.aux_loss
+    (uses getattr with safe defaults -> older configs still work).
+  - training_step adds the aux losses on the full-resolution prediction; if
+    config.train.aux_loss.apply_to_pyramid=True it also applies them across the
+    up_proj pyramid (M7 x M9). Logs aux_sam / aux_fft / aux_perceptual.
+  - configure_optimizers still optimises self.net.parameters() only, so the
+    frozen perceptual backbone is never updated.
+
+MODIFIED  config/base_config.py
+  - Added the train.aux_loss Namespace (defaults below).
+
+MODIFIED  config/ecrformer_config.py
+  - Added gated_skip=True to net.cfg (inherited by ecrformer_light_config.py).
+
+MODIFIED  requirements.txt
+  - Added an optional (commented) open_clip_torch line for RemoteCLIP.
+
+REMOVED (not needed for from-scratch training)
+  - pretrained/                 (light.ckpt, full.ckpt  ~60 MB of weights)
+  - assets/                     (README images / figures)
+  - visualize_predictions.ipynb (8.9 MB demo notebook)
+  - convert_ckpt_to_weights.py  (utility for converting released checkpoints)
+
+KEPT
+  - test.py  -> standalone evaluation script for after training.
+  - All model / data / config / util source, README.md, requirements.txt.
+  - .git/    -> version history (delete if you want a clean tree).
+
+
+================================================================================
+2. NEW CONFIG KNOBS (config/base_config.py -> self.train.aux_loss)
+================================================================================
+
+  sam_weight          = 0.05      # weight of the spectral-angle loss
+  fft_weight          = 0.10      # weight of the Fourier amplitude loss
+  fft_mode            = 'amplitude'   # 'amplitude' | 'focal'
+  perceptual_weight   = 0.10      # weight of the perceptual loss
+  perceptual_backbone = 'lpips'   # 'lpips' | 'remoteclip'
+  perceptual_net      = 'vgg'     # LPIPS trunk when backbone='lpips'
+  remoteclip_ckpt     = None      # path to RemoteCLIP weights (remoteclip only)
+  apply_to_pyramid    = False     # also apply M9 losses on the up_proj pyramid
+
+  Model (config/ecrformer_config.py -> net.cfg):
+  gated_skip          = True      # M7 gated cross-scale skip connections
+
+  Total training objective:
+    L = L_base (existing L1+SSIM + SDFL proj losses, unchanged)
+        + sam_weight        * L_SAM
+        + fft_weight        * L_FFT
+        + perceptual_weight * L_perceptual
+
+  To reproduce the ORIGINAL ECRformer: set sam_weight=fft_weight=
+  perceptual_weight=0.0 and gated_skip=False.
+
+
+================================================================================
+3. ENVIRONMENT SETUP
+================================================================================
+
+  Python 3.10+ recommended. Create an environment and install:
+
+    pip install -r requirements.txt
+
+  Install a CUDA build of PyTorch matching your GPU (the requirements file only
+  pins torch>=2.0). Example (CUDA 12.1):
+
+    pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+  The VGG weights for the LPIPS perceptual loss download automatically on first
+  use (~528 MB, one time). If you train OFFLINE, either pre-download them or set
+  perceptual_weight=0.0.
+
+  Optional (only for perceptual_backbone='remoteclip'):
+    pip install open_clip_torch
+  then point remoteclip_ckpt at the RemoteCLIP weights.
+
+
+================================================================================
+4. DATA PREPARATION (SEN12MS-CR)
+================================================================================
+
+  1) Download SEN12MS-CR.
+  2) Set the dataset root in config/base_config.py:
+         self.dataset.root = r"/path/to/SEN12MS-CR"
+  3) (Optional, faster IO) convert to .npz with:
+         python data/convert_sen12mscr_to_npz.py
+     and switch dataset.name to the npz dataset if you use it.
+
+  Channel layout (do not change unless your data differs):
+    input  = ['SAR'(2), 'cloudy'(13)]  -> 15 input channels
+    output = ['target'(13)]            -> 13 output channels
+  Images are normalised to [0, 1] (dataset.data_range = 1.0); the SAM/FFT/LPIPS
+  losses assume this range.
+
+
+================================================================================
+5. TRAINING
+================================================================================
+
+  Full model:
+    python train.py --config ecrformer
+
+  Lightweight model:
+    python train.py --config ecrformer_light
+
+  Useful flags:
+    -n, --name       run name suffix (experiment folder / TB run)
+    -g, --gpu        GPU index (default 0)
+    --no-resume      ignore any auto-found checkpoint and start fresh
+
+  Behaviour notes:
+    - Auto-resume: if a checkpoint for the run exists under ./experiments it is
+      picked up automatically. Use --no-resume to force a clean start.
+    - Default schedule: AdamW lr=4e-4, MultiStepLR, max 200 epochs, early-stop
+      patience 10 on valid_loss, gradient clipping 0.5.
+    - Effective batch size 16 via batch_size x accumulate_grad_batches
+      (full: 4x4, light: 8x2). Lower train_bs if you hit OOM.
+
+  Monitor:
+    tensorboard --logdir experiments
+  New scalars to watch: aux_sam, aux_fft, aux_perceptual (in addition to
+  train_MAE, train_SSIM, down_proj, up_proj, and the valid_* metrics).
+
+
+================================================================================
+6. EVALUATION (after training)
+================================================================================
+
+    python test.py --config ecrformer            # latest checkpoint
+    python test.py --config ecrformer --ckpt <path/to.ckpt>
+
+  Reports RMSE, MAE, PSNR, SAM, SSIM, LPIPS (see util/util.py:compute_metric).
+
+
+================================================================================
+7. RECOMMENDED EXPERIMENT MATRIX (to show each part earns its place)
+================================================================================
+
+  E0  baseline   : sam=fft=perc=0, gated_skip=False   (original ECRformer)
+  E1  +M7        : E0 + gated_skip=True
+  E2  +M9(SAM)   : E1 + sam=0.05
+  E3  +M9(SAM+FFT): E2 + fft=0.10
+  E4  +M9(full)  : E3 + perceptual=0.10               (the proposed model)
+
+  Keep every other hyper-parameter fixed across runs. SAM should drop most with
+  E2/E3; LPIPS should drop most with E4; PSNR/SSIM should rise gradually.
+
+
+================================================================================
+8. VERIFICATION ALREADY PERFORMED
+================================================================================
+
+  Environment: Windows, Python 3.12, torch 2.9.1 (CPU). All checks PASSED:
+
+  - py_compile / compileall on every modified file: OK.
+  - Config load (ecrformer & ecrformer_light): gated_skip=True, aux_loss knobs
+    present and inherited by the light variant.
+  - Model forward smoke test (128x128, in=15, out=13):
+      * gated_skip True and False both produce pred (1,13,128,128).
+      * up_proj pyramid shapes 32 -> 64 -> 128 (confirms MIMO heads).
+      * self.skip_gates is ModuleList(3) when gated, None when disabled.
+      * gradient flows through the skip gate.
+  - M9 losses: SAM/FFT(amplitude)/FFT(focal) compute and back-propagate;
+    identical inputs give ~0 loss; AuxiliaryLoss weighting is correct.
+  - Full training_step with the REAL config and a synthetic batch:
+      * SAM+FFT only            -> loss finite, net grad-norm ~2.5.
+      * SAM+FFT+perceptual(VGG) -> loss finite, net grad-norm ~1.95
+        (VGG-LPIPS weights downloaded successfully).
+
+  NOTE: not yet run on real SEN12MS-CR data or on GPU (no dataset/GPU in this
+  environment). The data pipeline itself is unchanged from upstream.
+
+
+================================================================================
+9. FINAL REVIEW - what is correct, and what to watch / what is still missing
+================================================================================
+
+  WHAT IS SOLID
+  - M9 is fully wired, configurable, differentiable, and zero-cost at inference.
+  - M7 gated skip is a true drop-in (channel counts preserved) with a safe
+    fallback; the MIMO pyramid you asked for already existed and is reused.
+  - Backward-compatible: original ECRformer is recoverable via config.
+
+  THINGS TO BE AWARE OF (not bugs, but design choices / caveats)
+  1. Perceptual loss domain. Default is VGG-LPIPS on RGB bands only - it ignores
+     the other 10 spectral bands and is natural-image (not RS) pretrained. For a
+     stronger publication result switch to perceptual_backbone='remoteclip'
+     (the hook is implemented; you must supply weights + open_clip_torch).
+  2. The frozen LPIPS/VGG weights are part of self.aux_loss and therefore land
+     in the Lightning checkpoint's state_dict (a few hundred MB). Harmless for
+     training, but if you later load weights with strict=True keep this in mind
+     (test.py uses extract_state_dict/load helpers that you can filter).
+  3. Loss weights (0.05 / 0.1 / 0.1) are the roadmap's suggested starting point.
+     If terms fight each other, consider uncertainty weighting (Kendall 2018) or
+     a short warm-up with aux weights ramped from 0.
+  4. SAM gradient near perfectly-aligned spectra is clamped (clamp_eps=1e-6);
+     this is intentional for stability and gives a tiny non-zero floor.
+  5. apply_to_pyramid=False by default. Turning it on adds the M9 losses on the
+     coarse up_proj outputs too (cheap, can help convergence) - try it in
+     ablations.
+  6. FFT loss uses norm='ortho' over the full image; with 128x128 crops this is
+     fine. If you change crop size drastically, re-check the fft_weight scale.
+
+  WHAT IS DEFERRED (explicitly NOT in this change set - your roadmap v1 list)
+  - M1 (Bi-Cross Modal Attention), M2 (Wavelet-Decoupled U-Net), M3
+    (Hierarchical Cross-Scale Mixer), M5 (MoE-FFN), M8 (diffusion refiner) are
+    NOT implemented here. As agreed, this commit is the "almost-free" M9 + M7
+    foundation; the heavier architectural modules come next.
+
+  RECOMMENDED NEXT STEP
+  - Run E0 vs E4 on a small SEN12MS-CR subset for a few epochs to confirm the
+    loss curves behave (aux terms decreasing, no NaNs) before a full run, then
+    proceed to M2/M1 from the roadmap.
+
+================================================================================
+END
+================================================================================

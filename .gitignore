@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.env
+.venv
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.claude/
+
+# Experiments, checkpoints, results
+experiments/
+experiment/
+lightning_logs/
+*.ckpt
+*.pt
+*.pth
+result/
+results/
+
+# Data files
+*.npz
+*.npy
+*.h5
+*.hdf5
+datasets/
+data/SEN12MS*/
+
+# Logs & TensorBoard
+*.log
+runs/
+tb_logs/
+
+# Images / notebooks (generated outputs)
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
