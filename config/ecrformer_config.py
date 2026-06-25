@@ -20,6 +20,7 @@ class ECRformerConfig(BaseConfig):
             pos_encoding=None,
             drop_path_rate=0.,
             gated_skip=True,   # M7: gated cross-scale skip connections
+            bcma=True,         # M1: Bi-Cross-Modal Attention stem
         )
 
         self.net.output = ['target']

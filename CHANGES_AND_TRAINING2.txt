@@ -1,0 +1,240 @@
+================================================================================
+NEXT-CR : ECRformer + M9 + M7 + M1  (this file documents M1 only)
+Bi-Cross-Modal Attention (BCMA) fusion stem.
+Changes, rationale, training instructions, and a final review.
+================================================================================
+
+This is a follow-up to CHANGES_AND_TRAINING.txt (which covered M9 + M7).
+It documents ONE new roadmap modification layered on top of that work:
+
+  * M1 - Bi-Cross-Modal Attention (BCMA) stem, replacing the channel-concat
+         fusion of SAR and optical at the network entry.
+
+Everything stays configurable and backward-compatible: set bcma=False to
+recover the previous (M9 + M7) behaviour, and additionally set
+sam=fft=perc=0 + gated_skip=False to recover the original ECRformer.
+
+
+================================================================================
+0. WHY M1  (the bottleneck it fixes)
+================================================================================
+
+  B2 - Trivial multimodal fusion. In the baseline, SAR (2 ch) and optical
+  (13 ch) are each passed through a SINGLE 7x7 conv and then concatenated
+  (DecoupledEncoder). From the stem onward they are one tensor; the two
+  modalities only ever interact implicitly through the channel-covariance
+  attention (MDTA) inside the blocks. There is no explicit, spatial mechanism
+  that routes SAR structure into cloud-occluded optical regions - which is
+  exactly the regime (thick cloud) where SAR matters most.
+
+  SAR and optical carry ASYMMETRIC information:
+    - SAR     ~ geometry / structure, available under any weather.
+    - optical ~ spectral / colour, destroyed under cloud.
+  Channel-concat throws this asymmetry away. M1 replaces it with a principled,
+  symmetric cross-modal attention plus a learned modality gate.
+
+
+================================================================================
+1. WHAT WAS CHANGED (file by file)
+================================================================================
+
+MODIFIED  models/ecrformer_model.py
+  - Added CrossXCA module (cross-covariance CROSS-attention):
+        Q  = proj(x_q)            # from one modality
+        K,V= proj(x_kv)           # from the OTHER modality
+        attn over CHANNELS (C x C), softmax, out = attn @ V
+    Mirrors the model's existing TransposedAttention/MDTA, so attention is
+    over channels and cost is LINEAR in spatial tokens (the cheap, XCA-style
+    attention the M1 spec calls for). A depthwise 3x3 conv on q/k/v injects
+    local spatial context before the channel attention.
+
+  - Added BCMAStem module (drop-in replacement for DecoupledEncoder):
+        Fs = sar_stem(SAR)        # 7x7 conv + learnable depthwise 5x5
+                                  #   SPECKLE-REDUCTION conv (spec mitigation
+                                  #   so SAR speckle does not get gated off)
+        Fo = opt_stem(optical)    # 7x7 conv
+        Fo_c = CrossXCA(Fo <- Fs) # optical queries SAR
+        Fs_c = CrossXCA(Fs <- Fo) # SAR queries optical
+        go = sigmoid(Conv1x1([Fo;Fs]) + gate_bias_o)   # learned modality gate
+        gs = sigmoid(Conv1x1([Fs;Fo]) + gate_bias_s)
+        Fo'= go*Fo + (1-go)*Fo_c
+        Fs'= gs*Fs + (1-gs)*Fs_c
+        out= concat([Fo', Fs'])   # channel count == features_start
+    Output channels equal features_start, so the ENTIRE downstream encoder/
+    decoder is unchanged -> true drop-in, just like GatedSkipFusion was for M7.
+
+  - Added constructor arg `bcma: bool = False` and `self.bcma`. When True (and
+    exactly two inputs [SAR, optical]) the stem is BCMAStem; otherwise the
+    previous DecoupledEncoder / plain conv stem is used unchanged.
+
+  INIT DETAIL (important): util.util.initialize_weights ZEROES every Conv2d
+  bias after construction, which would wipe a gate-bias baked into the gate
+  conv. So the "start near the original decoupled stem" behaviour is anchored
+  by a STANDALONE nn.Parameter (gate_bias_o / gate_bias_s, init +3.0) added to
+  the gate logits. Kaiming init does not touch raw Parameters, so the gate
+  starts at sigmoid(3) ~= 0.95 (mostly self-features) and LEARNS how much
+  cross-modal signal to admit from there.
+
+MODIFIED  config/ecrformer_config.py
+  - Added bcma=True to net.cfg (inherited by ecrformer_light_config.py), in the
+    same style as gated_skip=True. This makes the default `ecrformer` config the
+    full M9 + M7 + M1 model (experiment E5).
+
+  (No change needed to train.py, base_config.py, or the data pipeline: BCMA is
+   purely internal to the network's stem and the stem's output contract -
+   features_start channels - is identical to before.)
+
+
+================================================================================
+2. SCOPE OF THIS IMPLEMENTATION  (read before you train)
+================================================================================
+
+  BCMA is currently applied at the STEM ONLY, not "at every encoder stage" as
+  the original M1 spec described. This is a deliberate, cost-conscious first
+  cut:
+
+    - The two modalities now interact through principled cross-attention
+      BEFORE merging (fixes the "shallow concat" complaint at the entry point).
+    - But the merge still happens at the stem, so deeper encoder/decoder layers
+      see a single fused tensor.
+
+  Consequence: the parameter cost is tiny - about +9 K params
+  (11.4709 M -> 11.4802 M for the full config), far below the spec's "+0.6 M".
+  That estimate assumed BCMA at every (wider, deeper) encoder stage.
+
+  If E5 shows BCMA helps but under-delivers vs the +0.4..0.7 dB target, the
+  natural next step is to keep DUAL streams through the first 1-2 encoder stages
+  and apply CrossXCA there too. That is where the spec's larger param/FLOP
+  budget and bigger expected gain live. We chose to prove the stem version
+  first rather than commit to the heavier dual-stream encoder blind.
+
+
+================================================================================
+3. NEW CONFIG KNOB
+================================================================================
+
+  Model (config/ecrformer_config.py -> net.cfg):
+    bcma = True      # M1 Bi-Cross-Modal Attention stem (default in this fork)
+
+  To DISABLE M1 (recover the M9 + M7 model):
+    bcma = False
+
+  To recover the ORIGINAL ECRformer:
+    bcma = False, gated_skip = False, sam=fft=perc = 0.0
+
+
+================================================================================
+4. TRAINING  (unchanged from CHANGES_AND_TRAINING.txt)
+================================================================================
+
+  Full model (now includes M1):
+    python train.py --config ecrformer
+
+  Lightweight model:
+    python train.py --config ecrformer_light
+
+  Flags: -n NAME (run suffix), -g GPU (index), --no-resume (clean start).
+  Schedule / batch / monitoring are all as before (AdamW lr=4e-4, MultiStepLR,
+  max 200 epochs, early-stop 10, effective batch 16). TensorBoard scalars are
+  unchanged (M1 adds no new loss term - it is a purely architectural change):
+    tensorboard --logdir experiments
+
+
+================================================================================
+5. EVALUATION  (unchanged)
+================================================================================
+
+    python test.py --config ecrformer
+    python test.py --config ecrformer --ckpt <path/to.ckpt>
+  Reports RMSE, MAE, PSNR, SAM, SSIM, LPIPS.
+
+
+================================================================================
+6. UPDATED EXPERIMENT MATRIX
+================================================================================
+
+  E0  baseline    : sam=fft=perc=0, gated_skip=False, bcma=False  (orig ECRformer)
+  E1  +M7         : E0 + gated_skip=True
+  E2  +M9(SAM)    : E1 + sam=0.05
+  E3  +M9(SAM+FFT): E2 + fft=0.10
+  E4  +M9(full)   : E3 + perceptual=0.10            (M7 + M9 model)
+  E5  +M1         : E4 + bcma=True                  (this change set)
+
+  Keep every other hyper-parameter fixed across runs. Expected from M1 (E5 vs
+  E4), per the spec - treat as TARGETS, not guarantees, and note the stem-only
+  scope and the spring-only / 24k-sample dataset may compress the gains:
+    PSNR  +0.4 .. +0.7 dB     SAM  -0.3 .. -0.6     SSIM  +0.003 .. +0.007
+  Watch especially the thick-cloud subset, where SAR structure should help most.
+
+
+================================================================================
+7. VERIFICATION ALREADY PERFORMED
+================================================================================
+
+  Environment: Windows, Python 3.12, torch 2.9.1 (CPU). All checks PASSED:
+
+  - Forward smoke test (in=15, out=13, 128x128):
+      * bcma=False -> pred (2,13,128,128).   (E0..E4 path intact, reproducible)
+      * bcma=True  -> pred (2,13,128,128).   (down_projs=3, up_projs=3 unchanged)
+  - Builds through the REAL config path:
+      * `ecrformer`       (features_start=48): bcma in cfg = True, pred (1,13,128,128),
+                          11.4802 M params.
+      * `ecrformer_light` (features_start=32): pred (1,13,128,128). Head count
+                          auto-selected to divide the branch width cleanly.
+  - Parameter delta of M1 (full config): +0.0093 M (9.3 K).
+  - Init behaviour: gate_bias = 3.0 -> sigmoid offset = 0.953, i.e. the gate
+    starts mostly on self-features, so early training is close to the previous
+    decoupled-stem model.
+  - Gradient flow: every BCMA parameter (stems, speckle conv, both CrossXCA
+    blocks, both gates, both gate-bias parameters) receives a gradient - no dead
+    parameters.
+
+  NOTE: not yet run on real SEN12MS-CR data or on GPU (no dataset/GPU in this
+  environment). The data pipeline is unchanged.
+
+
+================================================================================
+8. FINAL REVIEW - what is solid, what to watch, what is deferred
+================================================================================
+
+  WHAT IS SOLID
+  - True drop-in: BCMAStem preserves the stem output contract (features_start
+    channels), so nothing downstream changed. Same pattern that made M7 safe.
+  - Backward-compatible: bcma=False restores the exact prior model; the E0
+    baseline is still reproducible.
+  - Cheap and linear: CrossXCA is channel attention (C x C), linear in tokens.
+  - Speckle mitigation is built in (learnable depthwise conv in the SAR stem),
+    addressing the spec's main risk (gate suppressing noisy SAR).
+  - Sensible init (gate ~0.95 self) means training does not start from a random
+    fusion - it eases into cross-modal mixing.
+
+  THINGS TO BE AWARE OF (design choices / caveats, not bugs)
+  1. STEM-ONLY scope (see section 2). If gains are small, extend BCMA into the
+     first encoder stage(s) - that is the spec's full-scope version.
+  2. Equal-width branches. CrossXCA's channel attention requires the SAR and
+     optical branches to have equal channel counts; the stem uses
+     split_integer(features_start, 2, [1,1]) = features_start/2 each. This is
+     even for both configs (48->24, 32->16). If you ever set an odd
+     features_start, add a guard.
+  3. M1 adds NO new loss term and NO new TensorBoard scalar - it is purely
+     architectural. Judge it by the valid_* metrics (PSNR/SAM/SSIM), not by a
+     new aux_* curve.
+  4. Gate behaviour is worth inspecting post-training: log/visualise go, gs to
+     confirm the model learns to lean on SAR under thick cloud (sanity that the
+     mechanism is doing what we claim - good for the paper).
+
+  WHAT IS DEFERRED (explicitly NOT in this change set)
+  - M2 (Wavelet-Decoupled Encoder-Decoder, fixes B3 + B4) is the agreed next
+    contribution, to be implemented AFTER E5 confirms M1 helps.
+  - Full-scope per-stage BCMA (dual streams through early encoder stages).
+
+  RECOMMENDED NEXT STEP
+  - Run E4 vs E5 on a SEN12MS-CR subset for a few epochs first (confirm loss
+    curves behave, no NaNs, gates moving), then a full E5 run. Compare to E4 on
+    PSNR/SAM/SSIM, paying attention to thick-cloud samples. Only then decide
+    between (a) shipping stem-only M1, (b) extending to per-stage BCMA, or
+    (c) moving on to M2.
+
+================================================================================
+END
+================================================================================

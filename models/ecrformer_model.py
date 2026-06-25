@@ -48,6 +48,7 @@ class ECRformerModel(nn.Module):
         num_refine: Optional[int] = None,
         pos_encoding: Optional[str] = None,
         gated_skip: bool = True,
+        bcma: bool = False,
     ) -> None:
         if num_layers < 1:
             raise ValueError(
@@ -72,6 +73,7 @@ class ECRformerModel(nn.Module):
         self.decoupled_input = decoupled_input
         self.bottle_neck = bottle_neck
         self.gated_skip = gated_skip
+        self.bcma = bcma
 
         num_bottle_neck = num_blocks[-1]
         self.num_bottle_neck = num_bottle_neck
@@ -80,7 +82,16 @@ class ECRformerModel(nn.Module):
         norm_type = get_norm(norm_type)
 
         # Stem
-        if self.decoupled_input:
+        if self.bcma:
+            # M1: Bi-Cross-Modal Attention stem (requires two decoupled inputs).
+            assert num_inputs == 2, \
+                f"bcma=True requires exactly two inputs [SAR, optical], got {in_chans}"
+            self.stem = BCMAStem(
+                in_ch_list=in_chans,
+                out_ch_list=split_integer(features_start, num_inputs, [1, 1]),
+                kernel_size=7,
+                conv_type=conv_type, norm_type=norm_type)
+        elif self.decoupled_input:
             self.stem = DecoupledEncoder(
                 in_ch_list=in_chans,
                 out_ch_list=split_integer(features_start, num_inputs, [1, 1]),
@@ -422,6 +433,130 @@ class GatedSkipFusion(nn.Module):
     def forward(self, x_dec: Tensor, x_enc: Tensor) -> Tensor:
         g = self.gate(torch.cat([x_dec, x_enc], dim=1))
         return torch.cat([x_dec, g * x_enc], dim=1)
+
+
+class CrossXCA(nn.Module):
+    """M1: Cross-covariance cross-attention (XCA).
+
+    Query is projected from ``x_q``, Key/Value from ``x_kv``. Like the model's
+    existing ``TransposedAttention`` (MDTA), attention is computed over the
+    channel dimension (a ``C x C`` map), so cost is **linear** in the number of
+    spatial tokens -- the cheap, XCA-style attention referenced in the M1 spec.
+    A depthwise 3x3 conv on q/k/v injects local spatial context before the
+    channel attention.
+    """
+
+    def __init__(self, dim: int, num_heads: int, bias: bool = True):
+        super().__init__()
+        self.num_heads = num_heads
+        self.temperature = nn.Parameter(torch.ones(num_heads, 1, 1))
+        self.q = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+        self.q_dw = nn.Conv2d(dim, dim, kernel_size=3, padding=1, groups=dim,
+                              bias=bias, padding_mode='reflect')
+        self.kv = nn.Conv2d(dim, dim * 2, kernel_size=1, bias=bias)
+        self.kv_dw = nn.Conv2d(dim * 2, dim * 2, kernel_size=3, padding=1,
+                               groups=dim * 2, bias=bias, padding_mode='reflect')
+        self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+
+    def forward(self, x_q: Tensor, x_kv: Tensor) -> Tensor:
+        _, _, h, w = x_q.shape
+        q = self.q_dw(self.q(x_q))
+        k, v = self.kv_dw(self.kv(x_kv)).chunk(2, dim=1)
+
+        q = rearrange(q, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        k = rearrange(k, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+        v = rearrange(v, 'b (head c) h w -> b head c (h w)', head=self.num_heads)
+
+        q = torch.nn.functional.normalize(q, dim=-1)
+        k = torch.nn.functional.normalize(k, dim=-1)
+
+        attn = (q @ k.transpose(-2, -1)) * self.temperature
+        attn = attn.softmax(dim=-1)
+        out = attn @ v
+
+        out = rearrange(out, 'b head c (h w) -> b (head c) h w',
+                        head=self.num_heads, h=h, w=w)
+        return self.project_out(out)
+
+
+class BCMAStem(nn.Module):
+    """M1: Bi-Cross-Modal Attention stem (fixes B2 -- trivial concat fusion).
+
+    Drop-in replacement for ``DecoupledEncoder``. SAR and optical are encoded by
+    separate 7x7 stems (the SAR stem includes a learnable depthwise
+    speckle-reduction conv, the spec's mitigation for SAR speckle suppressing
+    the gate). Each modality is then refined by cross-covariance cross-attention
+    against the other, and merged with its own features via a learned modality
+    gate::
+
+        F_o' = g_o * F_o + (1 - g_o) * CrossXCA(F_o <- F_s)   # optical <- SAR
+        F_s' = g_s * F_s + (1 - g_s) * CrossXCA(F_s <- F_o)   # SAR <- optical
+        out  = concat([F_o', F_s'])                            # == features_start
+
+    Output channels equal ``sum(out_ch_list)`` (== ``features_start``), so the
+    whole downstream encoder/decoder is untouched. ``initialize_weights`` zeros
+    every Conv2d bias, so the "start near the original decoupled stem" behaviour
+    is anchored by a standalone learnable ``gate_bias`` parameter (init +3 ->
+    gate ~= 0.95, i.e. mostly self-features) which Kaiming init does not touch.
+    """
+
+    def __init__(self, in_ch_list, out_ch_list, kernel_size: int = 7,
+                 num_heads: int = 4, conv_type=nn.Conv2d,
+                 norm_type=nn.BatchNorm2d, **kwargs):
+        super().__init__()
+        assert len(in_ch_list) == 2, \
+            f"BCMA expects exactly two modalities [SAR, optical], got {in_ch_list}"
+        assert out_ch_list[0] == out_ch_list[1], \
+            f"BCMA requires equal branch widths, got {out_ch_list}"
+        self.in_ch_list = list(in_ch_list)
+        sar_in, opt_in = in_ch_list
+        c = out_ch_list[0]
+
+        # pick the largest #heads (<= num_heads) that divides c
+        heads = num_heads
+        while c % heads != 0 and heads > 1:
+            heads -= 1
+        self.num_heads = heads
+        print(f"BCMAStem: SAR {sar_in}->{c}, optical {opt_in}->{c}, heads={heads}")
+
+        pad = kernel_size // 2
+        # SAR stem + learnable depthwise speckle-reduction conv
+        self.sar_stem = nn.Sequential(
+            nn.Conv2d(sar_in, c, kernel_size, padding=pad, padding_mode='reflect'),
+            nn.Conv2d(c, c, kernel_size=5, padding=2, groups=c,
+                      padding_mode='reflect'),
+        )
+        self.opt_stem = nn.Conv2d(opt_in, c, kernel_size, padding=pad,
+                                  padding_mode='reflect')
+
+        self.norm_oq = LayerNorm(c)
+        self.norm_ok = LayerNorm(c)
+        self.norm_sq = LayerNorm(c)
+        self.norm_sk = LayerNorm(c)
+        self.cross_o = CrossXCA(c, heads)   # optical queries SAR
+        self.cross_s = CrossXCA(c, heads)   # SAR queries optical
+
+        self.gate_o = nn.Conv2d(2 * c, c, kernel_size=1)
+        self.gate_s = nn.Conv2d(2 * c, c, kernel_size=1)
+        # survives initialize_weights (not a Conv2d/Linear/BN): keeps the gate
+        # near 1.0 at init so training starts close to the decoupled-stem model.
+        self.gate_bias_o = nn.Parameter(torch.tensor(3.0))
+        self.gate_bias_s = nn.Parameter(torch.tensor(3.0))
+
+    def forward(self, x):
+        sar, opt = torch.split(x, self.in_ch_list, dim=1)
+        Fs = self.sar_stem(sar)
+        Fo = self.opt_stem(opt)
+
+        Fo_c = self.cross_o(self.norm_oq(Fo), self.norm_ok(Fs))   # optical <- SAR
+        Fs_c = self.cross_s(self.norm_sq(Fs), self.norm_sk(Fo))   # SAR <- optical
+
+        go = torch.sigmoid(self.gate_o(torch.cat([Fo, Fs], dim=1)) + self.gate_bias_o)
+        gs = torch.sigmoid(self.gate_s(torch.cat([Fs, Fo], dim=1)) + self.gate_bias_s)
+
+        Fo = go * Fo + (1 - go) * Fo_c
+        Fs = gs * Fs + (1 - gs) * Fs_c
+        return torch.cat([Fo, Fs], dim=1)
 
 
 def posemb_sincos_2d(h, w, dim, temperature: int = 10000, dtype=torch.float32):

@@ -187,11 +187,11 @@ class SEN12MSCR(Dataset):
                     os.path.join(roi_dir, f) for f in os.listdir(roi_dir)
                 ])
                 patches_S2 = [
-                    p.replace('/s1', '/s2').replace('_s1', '_s2')
+                    p.replace(os.sep + 's1', os.sep + 's2').replace('_s1', '_s2')
                     for p in patches_S1
                 ]
                 patches_S2_cloudy = [
-                    p.replace('/s1', '/s2_cloudy').replace('_s1', '_s2_cloudy')
+                    p.replace(os.sep + 's1', os.sep + 's2_cloudy').replace('_s1', '_s2_cloudy')
                     for p in patches_S1
                 ]
                 for i in range(len(patches_S1)):

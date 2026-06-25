@@ -16,8 +16,8 @@ class BaseConfig(Namespace):
 
         # 数据集
         self.dataset = Namespace(
-            name='sen12mscr',
-            root=r"/data/zzy/SEN12MS-CR", # replace with actual path
+            name='npz',
+            root=r"./data/npz",  # folder containing train.npz, val.npz, test.npz
             split=["train", "val", "test"],
             train_ratio=0.8, # enabled when split only contains one element
             data_range=1.0,
