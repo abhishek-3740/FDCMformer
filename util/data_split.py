@@ -51,15 +51,31 @@ def resolve_eval_split_name(config, split_override: str | None = None) -> str:
     return splits[-1]
 
 
+def get_train_roots(config):
+    """Return the list of roots searched for the TRAIN split.
+
+    ``config.dataset.train_extra_roots`` (e.g. the Kaggle "part2" dataset that
+    only holds extra train shards) is appended to the primary root. val/test
+    keep using the primary root only.
+    """
+    root = config.dataset.root
+    extra = list(getattr(config.dataset, 'train_extra_roots', []) or [])
+    if not extra:
+        return root
+    primary = [root] if isinstance(root, (str, bytes)) else list(root)
+    return primary + extra
+
+
 def build_train_valid_datasets(config, dataset_class):
     splits = normalize_dataset_splits(config.dataset.split)
     root = config.dataset.root
+    train_roots = get_train_roots(config)
     data_range = config.dataset.data_range
     crop_size = config.dataset.crop_size
 
     if len(splits) >= 2:
         train_dataset = dataset_class(
-            root,
+            train_roots,
             split=splits[0],
             data_range=data_range,
             crop_size=crop_size,
@@ -78,13 +94,13 @@ def build_train_valid_datasets(config, dataset_class):
     base_split = splits[0]
     train_ratio = get_train_ratio(config)
     train_dataset_full = dataset_class(
-        root,
+        train_roots,
         split=base_split,
         data_range=data_range,
         crop_size=crop_size,
     )
     valid_dataset_full = dataset_class(
-        root,
+        train_roots,
         split=base_split,
         data_range=data_range,
     )

@@ -60,12 +60,19 @@ class SAMLoss(nn.Module):
             ``arccos`` diverges at ``±1``).
     """
 
-    def __init__(self, eps: float = 1e-8, clamp_eps: float = 1e-6):
+    def __init__(self, eps: float = 1e-6, clamp_eps: float = 1e-4):
         super().__init__()
         self.eps = eps
+        # NOTE: clamp_eps MUST be well above fp16 resolution (~1e-3 near 1.0),
+        # otherwise under autocast `1 - clamp_eps` rounds back to exactly 1.0,
+        # the clamp becomes a no-op, and acos'(±1) = -1/sqrt(1-cos^2) = -inf
+        # blows up the gradient. 1e-4 caps |grad| at ~1/sqrt(2e-4) ~= 70.
         self.clamp_eps = clamp_eps
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # Always evaluate in fp32: acos / sqrt are numerically fragile in fp16.
+        pred = pred.float()
+        target = target.float()
         # dot product over the spectral (channel) dimension
         dot = torch.sum(pred * target, dim=1)
         pred_norm = torch.sqrt(torch.sum(pred * pred, dim=1) + self.eps)
@@ -95,19 +102,33 @@ class FFTLoss(nn.Module):
           frequencies by the squared spectral distance.
     """
 
-    def __init__(self, mode: str = "amplitude", alpha: float = 1.0):
+    def __init__(self, mode: str = "amplitude", alpha: float = 1.0,
+                 eps: float = 1e-8):
         super().__init__()
         assert mode in ("amplitude", "focal"), f"Unsupported FFT loss mode: {mode}"
         self.mode = mode
         self.alpha = alpha
+        self.eps = eps
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # FFT is ill-defined / overflow-prone in fp16 (amplitudes can exceed the
+        # fp16 max of 65504 -> inf). Always compute in fp32.
+        pred = pred.float()
+        target = target.float()
         # 2-D FFT over the spatial dims; complex output [B, C, H, W//2 + 1]
         pred_fft = torch.fft.rfft2(pred, norm="ortho")
         target_fft = torch.fft.rfft2(target, norm="ortho")
 
         if self.mode == "amplitude":
-            return F.l1_loss(pred_fft.abs(), target_fft.abs())
+            # Compute the magnitude manually with an eps inside the sqrt.
+            # torch.abs() of a complex tensor has a 1/|z| term in its backward
+            # pass that becomes inf/NaN at near-zero frequency bins; the +eps
+            # below keeps the gradient finite.
+            pred_amp = torch.sqrt(
+                pred_fft.real ** 2 + pred_fft.imag ** 2 + self.eps)
+            target_amp = torch.sqrt(
+                target_fft.real ** 2 + target_fft.imag ** 2 + self.eps)
+            return F.l1_loss(pred_amp, target_amp)
 
         # focal frequency loss: distance in the complex plane, adaptively weighted
         diff = pred_fft - target_fft

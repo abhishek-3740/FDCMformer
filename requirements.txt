@@ -1,15 +1,29 @@
+# Core DL stack
 torch>=2.0
+torchvision>=0.15        # required by lpips (VGG); MUST match your torch version
 pytorch-lightning>=2.0
+
+# Model / data
 timm
 einops
 numpy
+scipy                    # pulled in by lpips; listed explicitly for clarity
+
+# Metrics / losses
+lpips                    # VGG-LPIPS perceptual loss + LPIPS metric (downloads VGG ~528MB on first use)
+
+# Utilities / logging
 tensorboard
 natsort
 tqdm
 matplotlib
 Pillow
-lpips
-# Optional: only needed for the M9 RemoteCLIP perceptual loss
+
+# Optional: only needed to CONVERT raw SEN12MS-CR GeoTIFFs -> .npz
+# (data/convert_sen12mscr_to_npz.py + data/sen12mscr_dataset.py).
+# NOT needed for training/eval on the prebuilt .npz shards.
+# rasterio
+
+# Optional: only needed for the M9 RemoteCLIP perceptual backbone
 # (config.train.aux_loss.perceptual_backbone = 'remoteclip')
 # open_clip_torch
-
