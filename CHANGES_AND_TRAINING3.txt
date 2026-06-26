@@ -1,64 +1,286 @@
-The critical problem I found
-  
-  The old data/npz_dataset.py loaded every shard fully into RAM (np.load + np.concatenate). I measured it: 2 local shards alone took the process
-  from 210 MB → 1475 MB. Your full train set (part1 ~60 + part2 ~60 shards at ~700 MB each) would need tens of GB of RAM and instantly OOM on Kaggle
-  (~30 GB). The smoke test only survived because it touched 2 shards. This had to be fixed before any GPU run.
-  
-  What I changed
-  
-  - data/npz_dataset.py (rewritten) — lazily memory-maps the uncompressed .npz shards. __init__ reads only the tiny .npy headers; each sample is
-  paged off disk on demand. Verified: RAM stays flat (210 → 210 MB) and values match np.load exactly, including across shard boundaries. It also now
-  accepts multiple roots and a flat shard dir, so it merges part1/train/ + part2/ (flat) for training while val/test stay on part1.
-  - util/data_split.py — train_extra_roots (part2) is appended to the train split only.
-  - config/base_config.py — added dataset.train_extra_roots, train.gpu, train.strategy.
-  - config/ecrformer_kaggle_config.py (new) — Kaggle paths, 16-mixed precision (T4 has no bf16), DDP, 2 GPUs, train_bs=4 × accumulate=2 × 2 GPUs =
-  effective batch 16, num_workers=2, checkpoints to /kaggle/working/experiments.
-  - train.py — --devices/--strategy/--precision flags + DDP-aware trainer. Single-GPU behavior unchanged; smoke test still passes end-to-end.
-  - kaggle_train.ipynb (new) — a validated 7-cell notebook that does everything.
-  
-  What you need to do on Kaggle
-  
-  1. Push this code somewhere Kaggle can read it. Easiest: zip the FDCMformer folder and upload it as a new Kaggle Dataset (e.g. fdcmformer-code).
-  The notebook auto-detects it by finding train.py.
-  2. Create a new Notebook, and in the right sidebar:
-    - Accelerator → GPU T4 ×2
-    - Internet → ON (required — LPIPS/VGG weights download on first validation)
-    - Add data: attach all three — your code dataset, sen12ms-cr-spring-part1, sen12ms-cr-spring-part2.
-  
-  3. Import kaggle_train.ipynb (File → Import Notebook) or paste its cells. Run cells 1–3 first to confirm the shard counts (you should see ~60
-  train in part1, 4 val, 19 test, ~60 in part2).
-  4. Save Version → Save & Run All (Commit) to train headless on both T4s.
-  
-  Things to know
-  
-  - 9-hour limit: training auto-resumes from last.ckpt. To continue past a timeout, attach the previous run's output as an input and copy
-  experiments/ into /kaggle/working/ (cell 5 + the resume markdown explain this).
-  - Effective batch = 16, matching the original single-GPU recipe.
-  - If you ever see NaNs from mixed precision, rerun cell 4 with --precision 32. If GPU OOM, lower train_bs and raise accumulate_grad_batches.
-  
-  One thing I could not verify here: an actual 2×T4 DDP run and the LPIPS download, since this is a Windows CPU box with no shards beyond the 2
-  local ones. The data-loading, config, multi-root merge, and pipeline wiring are all verified; the DDP/precision path will first exercise on
-  Kaggle.
+================================================================================
+NEXT-CR : ECRformer + M9 + M7 + M1  -  TRAINING ENABLEMENT (Kaggle 2x T4)
+This file documents the changes that make the model TRAINABLE at scale:
+data loading, multi-GPU, mixed-precision numerical fixes, schedule, and resume.
+================================================================================
+
+This is a follow-up to:
+  * CHANGES_AND_TRAINING.txt   - M9 (spectral losses) + M7 (gated skips)
+  * CHANGES_AND_TRAINING2.txt  - M1 (Bi-Cross-Modal Attention stem)
+
+Those two files cover the ARCHITECTURE / LOSS modifications. This file covers
+the work needed to actually RUN a real ~80-epoch training job on the full
+SEN12MS-CR "spring" set inside Kaggle's dual-T4 (16 GB x2, ~30 GB RAM, 9 h)
+environment - plus the correctness/stability bugs found and fixed along the way.
+
+Nothing here changes the model architecture or the loss math. Single-GPU
+behaviour is preserved: the original `python train.py --config ecrformer` path
+still works exactly as before; all new behaviour is opt-in via the new Kaggle
+config and new CLI flags.
+
+Commit: 4ed71dd "getting ready for kaggle training T4-GPU * 2"
+  10 files changed, 835 insertions(+), 72 deletions(-)
 
 
-  What I added for a professional 50–80 epoch run
-  
-  Training schedule (the key correctness fix): the LR scheduler milestones were hardcoded [120,150,170,180,190,200] for a 200-epoch run — at 80
-  epochs the learning rate would have never decayed. I made the schedule config-driven (lr_milestones, lr_gamma) and set the Kaggle config to
-  max_epoch=80, milestones [40,60,70,75], early_stop=15.
-  
-  Robust resume:
-  
-  - Fixed a real resume-breaking bug: the model pickled the whole config into the checkpoint, which fails to load under torch ≥2.6's
-  weights_only=True. Now ignored (save_hyperparameters(ignore=['config'])); verified a full save→resume cycle restores all states in-place.
-  - Rolling last.ckpt refreshed every 30 min and every epoch, so a mid-epoch kill loses little.
-  - Notebook now auto-copies a previous run's experiments/ from /kaggle/input so resume is one click across the 9h limit.
-  
-  Graceful stop: max_time='00:08:30:00' — Lightning stops cleanly and checkpoints ~30 min before Kaggle's hard 9h kill (no lost progress).
-  
-  Observability / hygiene: keeps top-3 best checkpoints named best-{epoch}-{valid_loss}.ckpt, a LearningRateMonitor, log_every_n_steps=20, and a
-  human-readable config_snapshot.json written next to the logs each run.
-  
-  All configurable from config/ecrformer_kaggle_config.py (epochs, schedule, save_top_k, ckpt_every_n_min, max_time); base defaults preserve the
-  original ECRformer behavior.
-  
+================================================================================
+0. THE CRITICAL PROBLEM (why this work was needed)
+================================================================================
+
+  RAM BLOW-UP IN THE DATA LOADER.
+  The old data/npz_dataset.py loaded every shard fully into RAM (np.load +
+  np.concatenate). Measured impact: 2 local shards alone took the process from
+  ~210 MB -> ~1475 MB. The full train set (part1 ~60 + part2 ~60 shards at
+  ~700 MB each) would need tens of GB of RAM and OOM instantly on Kaggle
+  (~30 GB). The earlier smoke test only survived because it touched 2 shards.
+
+  This had to be fixed before ANY GPU run could start. It is the headline fix
+  of this change set; the rest is the multi-GPU / schedule / resume plumbing
+  that a real Kaggle run also needs.
+
+
+================================================================================
+1. WHAT WAS CHANGED (file by file)
+================================================================================
+
+REWRITTEN  data/npz_dataset.py        (+249 / -... , the big one)
+  - Lazy memory-mapped loader. An uncompressed .npz (np.savez, NOT
+    savez_compressed) is just a ZIP of contiguous .npy entries, so we np.memmap
+    straight into the parent file at each array's data offset. __init__ now
+    reads ONLY the tiny .npy headers; each sample is paged off disk on demand.
+        * _read_npy_header()        - parses a .npy header (self-contained, no
+                                      private numpy APIs -> version robust).
+        * _zip_entry_data_offset()  - computes the absolute byte offset of an
+                                      entry's raw data via its LOCAL file header.
+        * _ShardMeta                - per-shard lazy metadata (dtype/shape/offset)
+                                      with no array data loaded.
+        * NPZ_Dataset               - cumulative-length index + bisect to map a
+                                      global idx -> (shard, local idx); memmaps
+                                      are opened lazily per worker (fork/spawn
+                                      safe, OS page cache shared across workers).
+    Result: RAM stays flat (210 -> 210 MB) and values match np.load exactly,
+    including across shard boundaries.
+  - Multi-root + flat-shard support. _resolve_shards() searches, per root:
+        1. <root>/<split>.npz             (single packed file)
+        2. <root>/<split>/shard_*.npz     (part1 layout: train/ val/ test/)
+        3. <root>/shard_*.npz             (flat shard dir, e.g. Kaggle part2)
+    Passing a LIST of roots merges all discovered shards (deduplicated by
+    resolved path). This is how the spring set, split across two Kaggle
+    datasets, is joined: train reads part1/train + part2, val/test read part1.
+  - Compressed-shard fallback: if a shard is ZIP_DEFLATED it can't be memmapped,
+    so it falls back to a cached np.load for that shard only.
+
+MODIFIED  util/data_split.py          (+22)
+  - get_train_roots(config): appends config.dataset.train_extra_roots (part2)
+    to the primary root for the TRAIN split ONLY; val/test keep the primary
+    root. build_train_valid_datasets() now passes the merged train roots to the
+    train dataset and the single root to the valid dataset.
+
+MODIFIED  config/base_config.py       (+14)
+  - dataset.train_extra_roots = []    (extra roots searched for train only)
+  - train.gpu        = [0]            (int count for multi-GPU, or list of idx)
+  - train.strategy   = 'auto'         ('auto' | 'ddp' | 'ddp_notebook')
+  - train.lr_milestones = [120,150,170,180,190,200] ; train.lr_gamma = 0.5
+                                      (LR schedule is now CONFIG-DRIVEN, see fix
+                                       #2 below - previously hardcoded)
+  - train.save_top_k = 1 ; train.ckpt_every_n_min = 0 ; train.max_time = None
+                                      (checkpoint / graceful-stop knobs, off by
+                                       default to preserve original behaviour)
+
+NEW  config/ecrformer_kaggle_config.py   (+98)
+  - ECRformerKaggleConfig(ECRformerConfig) - the full M9+M7+M1 model wired for
+    Kaggle 2x T4:
+        * _find_dataset_roots() auto-locates part1 (has train/val/test subdirs
+          with shards) and part2 (flat shard dir) under /kaggle/input at ANY
+          mount depth, with fallback to the conventional dataset slugs.
+        * precision = '16-mixed'   (T4 has NO bf16 -> fp16 mixed precision).
+        * strategy  = 'ddp', gpu = 2  (both T4s; subprocess `!python train.py`).
+        * train_bs=4, valid_bs=8, accumulate_grad_batches=2  ->
+          effective batch = 4 x 2 x 2 = 16  (matches the single-GPU 4x4 recipe).
+        * num_workers = 2          (Kaggle ~4 CPU cores, per DDP process).
+        * max_epoch=80, early_stop=15, lr_milestones=[40,60,70,75], gamma=0.5
+          (schedule rescaled for an 80-epoch budget - see fix #2).
+        * save_top_k=3, ckpt_every_n_min=30, max_time='00:08:30:00'
+          (resume robustness + graceful stop ~30 min before Kaggle's 9 h kill).
+        * save_dir = '/kaggle/working/experiments' (writable output dir).
+
+MODIFIED  train.py                    (+140)
+  - Multi-GPU trainer: pl.Trainer now takes devices=config.train.gpu and
+    strategy=config.train.strategy; new CLI flags --devices / --strategy /
+    --precision. --devices > 1 auto-enables DDP unless overridden. Single-GPU
+    path (-g GPU) is unchanged.
+  - Config-driven MultiStepLR (milestones + gamma from config) replacing the
+    hardcoded milestone list (fix #2).
+  - Checkpointing strategy:
+        * best_ckpt    - top-k by valid_loss, named best-{epoch}-{valid_loss}.
+        * resume_ckpt  - rolling last.ckpt, save_last=True, refreshed every epoch
+                         AND every ckpt_every_n_min minutes (train_time_interval)
+                         so a mid-epoch Kaggle timeout loses little.
+        * LearningRateMonitor added; log_every_n_steps now config-driven.
+  - max_time wired into the trainer for a clean, checkpointed stop before the
+    9 h hard kill.
+  - dump_config_snapshot(): writes a human-readable config_snapshot.json next to
+    the TensorBoard logs each run (rank-0 only, never breaks training).
+  - save_hyperparameters(ignore=['config']) - the resume-breaking fix (#3).
+
+MODIFIED  util/losses.py              (+27)
+  - fp16 numerical-stability fixes for SAM and FFT losses (fix #4 below).
+
+NEW  smoke_test.py (+131) / verify_modules.py (+142)
+  - Local CPU verification harnesses (forward shapes, param counts, gradient
+    flow, memmap RAM/correctness) used to validate the above without a GPU.
+
+
+================================================================================
+2. BUGS / CORRECTNESS FIXES (the "whatever fixes we applied" part)
+================================================================================
+
+  FIX #1 - Data loader RAM blow-up  (see section 0)
+    Cause   : np.load + np.concatenate loaded entire shards into RAM.
+    Fix     : lazy memory-mapping of uncompressed .npz entries.
+    Verified: RAM flat at ~210 MB; sample values byte-identical to np.load,
+              including across shard boundaries.
+
+  FIX #2 - LR scheduler never decayed on short runs
+    Cause   : milestones were HARDCODED [120,150,170,180,190,200] for a
+              200-epoch run. At max_epoch=80 the LR would NEVER decay.
+    Fix     : schedule is now config-driven (lr_milestones, lr_gamma); the
+              Kaggle config sets [40,60,70,75] for its 80-epoch budget.
+
+  FIX #3 - Resume broke under torch >= 2.6
+    Cause   : the LightningModule pickled the whole config object into the
+              checkpoint; torch>=2.6 loads with weights_only=True, which then
+              fails to unpickle it -> resume crash.
+    Fix     : save_hyperparameters(ignore=['config']). The model is always
+              rebuilt from config before fit(), so nothing is lost; a readable
+              config_snapshot.json is written alongside the logs instead.
+    Verified: a full save -> resume cycle restores all states in place.
+
+  FIX #4 - fp16 (mixed precision) NaN/inf in the M9 aux losses
+    Two parts, both "always compute in fp32":
+      (a) SAMLoss: acos'(+-1) = -1/sqrt(1-cos^2) -> -inf. Under fp16 the old
+          clamp_eps=1e-6 was BELOW fp16 resolution near 1.0 (~1e-3), so
+          1 - clamp_eps rounded back to exactly 1.0 and the clamp became a
+          no-op. Fix: clamp_eps raised to 1e-4 (caps |grad| ~= 70), eps to 1e-6,
+          and pred/target cast to .float() inside forward.
+      (b) FFTLoss: complex amplitudes can exceed the fp16 max (65504) -> inf,
+          and torch.abs() of a complex tensor has a 1/|z| term in its backward
+          that explodes at near-zero frequency bins. Fix: compute in fp32 and
+          take the magnitude manually as sqrt(re^2 + im^2 + eps) so the gradient
+          stays finite.
+    Belt-and-braces: in train.py the aux-loss block also runs inside
+    torch.autocast(..., enabled=False) on fp32-cast tensors, so SAM/FFT/
+    perceptual terms are evaluated in fp32 even under '16-mixed'.
+
+  FIX #5 - DataLoader worker safety with memmaps
+    The memmap handles are created LAZILY per worker (not pickled from the
+    parent), so the loader is fork/spawn safe and the OS page cache is shared
+    across workers; persistent_workers is enabled only when num_workers > 0.
+
+
+================================================================================
+3. NEW / CHANGED CONFIG KNOBS
+================================================================================
+
+  base_config.py -> dataset:
+    train_extra_roots = []          # extra roots searched for the TRAIN split only
+
+  base_config.py -> train:
+    gpu               = [0]         # int count (multi-GPU) OR list of indices
+    strategy          = 'auto'      # 'auto' | 'ddp' | 'ddp_notebook'
+    lr_milestones     = [...]       # MultiStepLR milestones (scale to epochs!)
+    lr_gamma          = 0.5         # LR decay factor at each milestone
+    save_top_k        = 1           # number of best (valid_loss) ckpts to keep
+    ckpt_every_n_min  = 0           # also refresh last.ckpt every N min (0=off)
+    max_time          = None        # wall-clock cap 'DD:HH:MM:SS' (graceful stop)
+
+  ecrformer_kaggle_config.py (the values to actually use on Kaggle):
+    precision '16-mixed', strategy 'ddp', gpu 2,
+    train_bs 4, valid_bs 8, accumulate_grad_batches 2  (effective batch 16),
+    num_workers 2, max_epoch 80, early_stop 15,
+    lr_milestones [40,60,70,75], save_top_k 3,
+    ckpt_every_n_min 30, max_time '00:08:30:00',
+    save_dir '/kaggle/working/experiments'.
+
+  New CLI flags (train.py):
+    --devices N        # number of GPUs (N>1 auto-enables DDP)
+    --strategy S       # 'ddp' (script) | 'ddp_notebook' (in-kernel)
+    --precision P      # '16-mixed' for T4, or '32' to disable mixed precision
+
+
+================================================================================
+4. HOW TO TRAIN ON KAGGLE (2x T4)
+================================================================================
+
+  1. Push this code where Kaggle can read it: zip the FDCMformer folder and
+     upload it as a Kaggle Dataset (e.g. fdcmformer-code). The notebook
+     auto-detects it by locating train.py.
+  2. New Notebook, right sidebar:
+       - Accelerator -> GPU T4 x2
+       - Internet    -> ON   (LPIPS/VGG weights download on first validation)
+       - Add data    -> attach all three: the code dataset,
+                         sen12ms-cr-spring-part1, sen12ms-cr-spring-part2.
+  3. Import kaggle_train.ipynb (File -> Import Notebook), or paste its cells.
+     Run cells 1-3 first to confirm shard counts (expect ~60 train in part1,
+     4 val, 19 test, ~60 in part2).
+  4. Launch training (subprocess, true DDP):
+       !python train.py -c ecrformer_kaggle --devices 2 --strategy ddp
+     In-kernel alternative:
+       !python train.py -c ecrformer_kaggle --devices 2 --strategy ddp_notebook
+  5. Save Version -> Save & Run All (Commit) to train headless on both T4s.
+
+  Resume across the 9 h limit:
+    - Training auto-resumes from last.ckpt (rolling, every epoch + every 30 min).
+    - To continue past a timeout, attach the previous run's OUTPUT as an input
+      and copy its experiments/ into /kaggle/working/ (the notebook automates
+      this). max_time stops cleanly ~30 min before Kaggle's hard kill.
+
+  Local / single-GPU (unchanged):
+    python train.py --config ecrformer            # full M9+M7+M1 model
+    python train.py --config ecrformer_light
+    Flags: -n NAME (run suffix), -g GPU (index), --no-resume (clean start).
+
+  TensorBoard:
+    tensorboard --logdir experiments
+    Scalars: train_MAE/SSIM, down_proj, up_proj, valid_* (RMSE/MAE/PSNR/SAM/
+    SSIM/LPIPS), learning_rate, and the M9 aux_* terms (aux_sam/fft/perceptual).
+
+
+================================================================================
+5. TROUBLESHOOTING
+================================================================================
+
+  - NaNs under mixed precision: rerun with --precision 32. (The SAM/FFT fp32
+    fixes in #4 should prevent this, but 32 is the safe fallback.)
+  - GPU OOM: lower train.train_bs and raise optim.accumulate_grad_batches to
+    keep the effective batch (=train_bs * accumulate * num_gpus) at 16.
+  - "No shards found": check that part1 has train/ val/ test/ subfolders with
+    shard_*.npz and part2 is a flat dir of shard_*.npz; cells 1-3 print counts.
+  - Resume not picking up: confirm the previous run's experiments/ was copied
+    into /kaggle/working/ and that the log_name (config name + -n suffix) matches.
+
+
+================================================================================
+6. VERIFICATION PERFORMED  (and what is NOT yet verified)
+================================================================================
+
+  Environment: Windows, Python 3.12, torch 2.x (CPU). PASSED:
+    - Memmap loader: RAM flat (~210 MB) over many random accesses; sample values
+      byte-identical to np.load, including across shard boundaries.
+    - Multi-root merge: part1/train + part2 (flat) discovered and concatenated;
+      val/test resolve to part1 only.
+    - Config path: ecrformer_kaggle builds; effective-batch arithmetic = 16.
+    - Single-GPU pipeline (train.py) still runs end-to-end (smoke_test.py).
+    - Resume: full save -> resume cycle restores states with the config-ignore
+      fix; no weights_only unpickle error.
+
+  NOT yet verified in this environment (no GPU / no full dataset here):
+    - An actual 2x T4 DDP run and the LPIPS/VGG weight download (first
+      validation). The data loading, config, multi-root merge, schedule, resume,
+      and trainer wiring are verified; the DDP + fp16 path will first exercise
+      live on Kaggle. If issues appear there, --precision 32 and the OOM knobs
+      above are the first levers.
+
+
+================================================================================
+END
+================================================================================
